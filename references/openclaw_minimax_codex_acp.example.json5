@@ -1,0 +1,198 @@
+// Example OpenClaw config for:
+// - default chat and routing on MiniMax
+// - Feishu as the mobile entry channel
+// - Codex used only when you explicitly spawn an ACP coding session
+//
+// Save as: ~/.openclaw/openclaw.json
+// Then replace placeholder values before use.
+
+{
+  env: {
+    // Keep secrets in the host env or a secret manager in production.
+    MINIMAX_API_KEY: "${MINIMAX_API_KEY}",
+  },
+
+  session: {
+    // Recommended for multi-user or multi-chat setups.
+    dmScope: "per-channel-peer",
+    reset: {
+      mode: "idle",
+      idleMinutes: 240,
+    },
+  },
+
+  models: {
+    mode: "merge",
+    providers: {
+      // Official MiniMax API-key provider shape from the OpenClaw docs.
+      minimax: {
+        baseUrl: "https://api.minimax.io/anthropic",
+        apiKey: "${MINIMAX_API_KEY}",
+        api: "anthropic-messages",
+        models: [
+          {
+            id: "MiniMax-M2.7",
+            name: "MiniMax M2.7",
+            reasoning: true,
+            input: ["text", "image"],
+            contextWindow: 204800,
+            maxTokens: 131072,
+          },
+          {
+            id: "MiniMax-M2.7-highspeed",
+            name: "MiniMax M2.7 Highspeed",
+            reasoning: true,
+            input: ["text", "image"],
+            contextWindow: 204800,
+            maxTokens: 131072,
+          },
+        ],
+      },
+    },
+  },
+
+  acp: {
+    enabled: true,
+    dispatch: { enabled: true },
+    backend: "acpx",
+    defaultAgent: "codex",
+    allowedAgents: ["codex"],
+  },
+
+  plugins: {
+    entries: {
+      // ACP coding sessions are non-interactive.
+      // Without approve-all, file writes and shell exec can fail mid-run.
+      acpx: {
+        enabled: true,
+        config: {
+          permissionMode: "approve-all",
+          nonInteractivePermissions: "fail",
+        },
+      },
+    },
+  },
+
+  agents: {
+    defaults: {
+      workspace: "/srv/openclaw/workspace/main",
+      models: {
+        "minimax/MiniMax-M2.7": { alias: "main" },
+        "minimax/MiniMax-M2.7-highspeed": { alias: "main-fast" },
+      },
+      model: {
+        primary: "minimax/MiniMax-M2.7",
+        fallbacks: ["minimax/MiniMax-M2.7-highspeed"],
+      },
+    },
+    list: [
+      {
+        id: "main",
+        default: true,
+        name: "Feishu Main",
+        workspace: "/srv/openclaw/workspace/main",
+        model: {
+          primary: "minimax/MiniMax-M2.7",
+          fallbacks: ["minimax/MiniMax-M2.7-highspeed"],
+        },
+      },
+      {
+        id: "codex",
+        name: "Codex Worker",
+        workspace: "/srv/openclaw/workspaces/default",
+        runtime: {
+          type: "acp",
+          acp: {
+            agent: "codex",
+            backend: "acpx",
+            mode: "persistent",
+            cwd: "/srv/openclaw/workspaces/default",
+          },
+        },
+      },
+    ],
+  },
+
+  bindings: [
+    // All ordinary Feishu traffic goes to the main MiniMax-backed agent.
+    {
+      type: "route",
+      agentId: "main",
+      match: {
+        channel: "feishu",
+        accountId: "main",
+      },
+    },
+
+    // Optional: hard-bind one known DM to the Codex ACP agent.
+    // Use only after you know the user's open_id.
+    // {
+    //   type: "acp",
+    //   agentId: "codex",
+    //   match: {
+    //     channel: "feishu",
+    //     accountId: "main",
+    //     peer: { kind: "direct", id: "ou_xxx_replace_me" },
+    //   },
+    //   acp: {
+    //     label: "codex-feishu-dm",
+    //     cwd: "/srv/openclaw/workspaces/repo-a",
+    //   },
+    // },
+
+    // Optional: hard-bind one Feishu topic to a persistent Codex ACP session.
+    // {
+    //   type: "acp",
+    //   agentId: "codex",
+    //   match: {
+    //     channel: "feishu",
+    //     accountId: "main",
+    //     peer: { kind: "group", id: "oc_group_chat:topic:om_topic_root" },
+    //   },
+    //   acp: {
+    //     label: "codex-feishu-topic",
+    //     cwd: "/srv/openclaw/workspaces/repo-a",
+    //   },
+    // },
+  ],
+
+  channels: {
+    feishu: {
+      enabled: true,
+      defaultAccount: "main",
+
+      // Use "lark" for international tenants. Omit or switch for CN Feishu.
+      domain: "lark",
+
+      // DM recommendation for v1: start with pairing or allowlist.
+      dmPolicy: "pairing",
+      // allowFrom: ["ou_your_open_id"],
+
+      // Group/topic recommendation for v1: keep explicit allowlist + mention gating.
+      groupPolicy: "allowlist",
+      groupAllowFrom: [
+        "oc_replace_with_group_chat_id",
+      ],
+      requireMention: true,
+      groups: {
+        oc_replace_with_group_chat_id: {
+          requireMention: true,
+          allowFrom: [
+            "ou_replace_with_allowed_user_open_id",
+          ],
+        },
+      },
+
+      streaming: true,
+      blockStreaming: true,
+
+      accounts: {
+        main: {
+          appId: "cli_xxx_replace_me",
+          appSecret: "replace_me",
+          name: "Remote Coding Bot",
+        },
+      },
+    },
+  },
+}
