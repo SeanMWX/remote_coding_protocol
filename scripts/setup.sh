@@ -1,431 +1,481 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# remote_coding_protocol Setup Script
-# Usage: bash setup.sh
+# remote_coding_protocol setup
 #
-# This script sets up the OpenClaw + Codex ACP environment for remote coding.
-# It will prompt for GitHub token if not already configured.
+# Safe, repeatable installer for:
+# - MiniMax as the default chat model
+# - Feishu as the chat channel
+# - Codex via OpenClaw ACP for coding sessions
 #
 
-set -e
+set -euo pipefail
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-OPENCLAW_DIR="$HOME/.openclaw"
-SKILL_DIR="$OPENCLAW_DIR/skills/remote_coding_protocol"
-WORKSPACES_DIR="$OPENCLAW_DIR/workspaces/codex-test"
-CONFIG_FILE="$OPENCLAW_DIR/openclaw.json"
+OPENCLAW_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+ENV_FILE="$OPENCLAW_DIR/.env"
+DEFAULT_WORKSPACE="$OPENCLAW_DIR/workspace"
+CODEX_WORKSPACE_DEFAULT="$OPENCLAW_DIR/workspaces/remote-coding"
+DEFAULT_FEISHU_ACCOUNT="main"
+CODEX_WORKSPACE="$CODEX_WORKSPACE_DEFAULT"
 
-echo_step() {
+log_step() {
   echo -e "${GREEN}[Step]${NC} $1"
 }
 
-echo_warn() {
+log_warn() {
   echo -e "${YELLOW}[Warn]${NC} $1"
 }
 
-echo_error() {
-  echo -e "${RED}[Error]${NC} $1"
+log_error() {
+  echo -e "${RED}[Error]${NC} $1" >&2
 }
 
-# ============================================================================
-# Step 1: Check and install bubblewrap
-# ============================================================================
-echo_step "Checking bubblewrap installation..."
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    log_error "Required command not found: $1"
+    exit 1
+  fi
+}
 
-if command -v bwrap &> /dev/null; then
-  echo "  bubblewrap already installed: $(bwrap --version)"
-else
-  echo "  bubblewrap not found, installing..."
-  if command -v sudo &> /dev/null; then
-    sudo apt-get update && sudo apt-get install -y bubblewrap
+ensure_state_dir() {
+  mkdir -p "$OPENCLAW_DIR"
+  touch "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+load_env_file() {
+  if [ -f "$ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
+}
+
+upsert_env_var() {
+  local key="$1"
+  local value="$2"
+  local tmp
+
+  tmp="$(mktemp)"
+  if [ -f "$ENV_FILE" ]; then
+    grep -v "^${key}=" "$ENV_FILE" >"$tmp" || true
+  fi
+  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  mv "$tmp" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+}
+
+unset_env_var() {
+  local key="$1"
+  local tmp
+
+  tmp="$(mktemp)"
+  if [ -f "$ENV_FILE" ]; then
+    grep -v "^${key}=" "$ENV_FILE" >"$tmp" || true
+    mv "$tmp" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
   else
-    apt-get update && apt-get install -y bubblewrap
+    rm -f "$tmp"
   fi
-  echo "  bubblewrap installed successfully"
-fi
+}
 
-# ============================================================================
-# Step 2: Check Codex login status
-# ============================================================================
-echo_step "Checking Codex login status..."
+prompt_var() {
+  local key="$1"
+  local label="$2"
+  local secret="${3:-false}"
+  local required="${4:-true}"
+  local default="${5:-}"
+  local current="${!key:-}"
+  local prompt_suffix=""
+  local reply=""
 
-CODEX_AUTH_FILE="$HOME/.codex/auth.json"
-if [ -f "$CODEX_AUTH_FILE" ]; then
-  AUTH_MODE=$(grep -o '"auth_mode":"[^"]*"' "$CODEX_AUTH_FILE" 2>/dev/null | cut -d'"' -f4 || echo "unknown")
-  echo "  Codex is logged in (mode: $AUTH_MODE)"
-
-  # Check if token is expired
-  if grep -q '"expires"' "$CODEX_AUTH_FILE" 2>/dev/null; then
-    EXPIRES=$(grep '"expires"' "$CODEX_AUTH_FILE" | grep -oP '"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}' | head -1)
-    echo "  Token expires: $EXPIRES"
+  if [ -n "$current" ]; then
+    if [ "$secret" = "true" ]; then
+      prompt_suffix=" [Press Enter to keep existing]"
+    else
+      prompt_suffix=" [${current}]"
+    fi
+  elif [ -n "$default" ]; then
+    prompt_suffix=" [${default}]"
   fi
-else
-  echo_error "Codex is NOT logged in!"
-  echo ""
-  echo "  Please run the following command to login:"
-  echo "    codex login"
-  echo ""
-  echo "  After login, run this script again."
-  exit 1
-fi
 
-# ============================================================================
-# Step 3: Check GitHub Token
-# ============================================================================
-echo_step "Checking GitHub Token..."
+  while true; do
+    if [ "$secret" = "true" ]; then
+      read -r -s -p "${label}${prompt_suffix}: " reply
+      echo ""
+    else
+      read -r -p "${label}${prompt_suffix}: " reply
+    fi
 
-# Try to read from existing config first
-GITHUB_TOKEN=""
-if [ -f "$CONFIG_FILE" ]; then
-  EXISTING_TOKEN=$(grep -o '"GITHUB_TOKEN":"[^"]*"' "$CONFIG_FILE" 2>/dev/null | cut -d'"' -f4)
-  if [ -n "$EXISTING_TOKEN" ]; then
-    GITHUB_TOKEN="$EXISTING_TOKEN"
-    echo "  Found existing GitHub Token in config"
+    if [ -z "$reply" ]; then
+      if [ -n "$current" ]; then
+        reply="$current"
+      elif [ -n "$default" ]; then
+        reply="$default"
+      fi
+    fi
+
+    if [ "$required" = "true" ] && [ -z "$reply" ]; then
+      log_warn "${label} is required."
+      continue
+    fi
+    break
+  done
+
+  printf -v "$key" '%s' "$reply"
+  export "$key"
+}
+
+json_get_or_default() {
+  local path="$1"
+  local fallback="$2"
+  local value
+
+  if value="$(openclaw config get "$path" --json 2>/dev/null)"; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$fallback"
   fi
-fi
+}
 
-# If no token found, prompt user
-if [ -z "$GITHUB_TOKEN" ]; then
-  echo ""
-  echo "  No GitHub Token found in config."
-  echo "  Please provide your GitHub Personal Access Token."
-  echo "  (Need 'repo' permission for push access)"
-  echo ""
-  echo -n "  GitHub Token: "
-  read -r GITHUB_TOKEN
+merge_agents() {
+  local current_json="$1"
+  local main_workspace="$2"
+  local codex_workspace="$3"
+  local output_file="$4"
 
-  if [ -z "$GITHUB_TOKEN" ]; then
-    echo_error "GitHub Token is required. Setup cancelled."
-    exit 1
-  fi
-fi
+  CURRENT_JSON="$current_json" MAIN_WORKSPACE="$main_workspace" CODEX_WORKSPACE="$codex_workspace" OUTPUT_FILE="$output_file" python3 - <<'PY'
+import json
+import os
+from copy import deepcopy
 
-# Validate token format
-if [[ ! "$GITHUB_TOKEN" =~ ^ghp_ ]]; then
-  echo_warn "Token doesn't look like a GitHub PAT (should start with ghp_)"
-  echo -n "  Continue anyway? (y/N): "
-  read -r confirm
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-    echo "Setup cancelled."
-    exit 1
-  fi
-fi
+current = json.loads(os.environ["CURRENT_JSON"] or "[]")
+main_workspace = os.environ["MAIN_WORKSPACE"]
+codex_workspace = os.environ["CODEX_WORKSPACE"]
+output_file = os.environ["OUTPUT_FILE"]
 
-# ============================================================================
-# Step 4: Create directories
-# ============================================================================
-echo_step "Creating workspace directories..."
-
-mkdir -p "$WORKSPACES_DIR"
-echo "  Workspace: $WORKSPACES_DIR"
-
-# ============================================================================
-# Step 5: Get Feishu user ID from existing config or prompt
-# ============================================================================
-echo_step "Checking Feishu configuration..."
-
-FEISHU_USER_ID=""
-if [ -f "$CONFIG_FILE" ]; then
-  # Try to extract from existing bindings
-  FEISHU_USER_ID=$(grep -o '"id":"ou_[^"]*"' "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d'"' -f4)
-  if [ -n "$FEISHU_USER_ID" ]; then
-    echo "  Found Feishu user ID: $FEISHU_USER_ID"
-  fi
-fi
-
-if [ -z "$FEISHU_USER_ID" ]; then
-  echo ""
-  echo "  Please provide your Feishu Open ID for DM binding."
-  echo "  (You can find it in OpenClaw logs or Feishu bot settings)"
-  echo ""
-  echo -n "  Feishu Open ID (ou_xxx): "
-  read -r FEISHU_USER_ID
-
-  if [ -z "$FEISHU_USER_ID" ]; then
-    echo_warn "No Feishu user ID provided, using default binding method"
-    FEISHU_USER_ID="ou_b5cd015316fce96537e3def26e513822"  # Will be replaced by actual
-  fi
-fi
-
-# ============================================================================
-# Step 6: Backup existing config
-# ============================================================================
-if [ -f "$CONFIG_FILE" ]; then
-  BACKUP_FILE="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$CONFIG_FILE" "$BACKUP_FILE"
-  echo_step "Backed up existing config to: $BACKUP_FILE"
-fi
-
-# ============================================================================
-# Step 7: Generate openclaw.json
-# ============================================================================
-echo_step "Generating OpenClaw configuration..."
-
-cat > "$CONFIG_FILE" << 'EOF'
-{
-  "meta": {
-    "lastTouchedVersion": "2026.3.28",
-    "lastTouchedAt": "2026-03-31T18:16:17.195Z"
-  },
-  "wizard": {
-    "lastRunAt": "2026-03-31T18:16:17.164Z",
-    "lastRunVersion": "2026.3.28",
-    "lastRunCommand": "configure",
-    "lastRunMode": "local"
-  },
-  "auth": {
-    "profiles": {
-      "minimax:cn": {
-        "provider": "minimax",
-        "mode": "api_key"
-      }
-    }
-  },
-  "env": {
-    "GITHUB_TOKEN": "GITHUB_TOKEN_PLACEHOLDER"
-  },
-  "models": {
-    "mode": "merge",
-    "providers": {
-      "minimax": {
-        "baseUrl": "https://api.minimaxi.com/anthropic",
-        "api": "anthropic-messages",
-        "authHeader": true,
-        "models": [
-          {
-            "id": "MiniMax-M2.7",
-            "name": "MiniMax M2.7",
-            "reasoning": true,
-            "input": ["text"],
-            "cost": {
-              "input": 0.3,
-              "output": 1.2,
-              "cacheRead": 0.06,
-              "cacheWrite": 0.375
-            },
-            "contextWindow": 204800,
-            "maxTokens": 131072
-          }
-        ]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "minimax/MiniMax-M2.7"
-      },
-      "models": {
-        "minimax/MiniMax-M2.7": {
-          "alias": "Minimax"
-        }
-      },
-      "workspace": "WORKSPACE_DEFAULT"
-    },
-    "list": [
-      {
+patches = [
+    {
         "id": "main",
-        "default": true,
+        "default": True,
         "name": "Feishu Main",
-        "workspace": "WORKSPACE_DEFAULT",
-        "model": {
-          "primary": "minimax/MiniMax-M2.7"
-        }
-      },
-      {
+        "workspace": main_workspace,
+        "model": {"primary": "minimax/MiniMax-M2.7"},
+    },
+    {
         "id": "codex",
         "name": "Codex Worker",
-        "workspace": "WORKSPACE_CODEX",
-        "model": {
-          "primary": "minimax/MiniMax-M2.7"
-        },
+        "workspace": codex_workspace,
         "runtime": {
-          "type": "acp",
-          "acp": {
-            "agent": "codex",
-            "backend": "acpx",
-            "mode": "persistent",
-            "cwd": "WORKSPACE_CODEX"
-          }
-        }
-      }
-    ]
-  },
-  "tools": {
-    "profile": "coding",
-    "web": {
-      "search": {
-        "provider": "brave"
-      }
-    }
-  },
-  "commands": {
-    "native": "auto",
-    "nativeSkills": "auto",
-    "restart": true,
-    "ownerDisplay": "raw"
-  },
-  "session": {
-    "dmScope": "per-channel-peer"
-  },
-  "acp": {
-    "enabled": true,
-    "dispatch": {
-      "enabled": true
+            "type": "acp",
+            "acp": {
+                "agent": "codex",
+                "backend": "acpx",
+                "mode": "persistent",
+                "cwd": codex_workspace,
+            },
+        },
     },
-    "backend": "acpx",
-    "defaultAgent": "codex",
-    "allowedAgents": ["codex"]
-  },
-  "bindings": [
-    {
-      "type": "route",
-      "agentId": "main",
-      "match": {
-        "channel": "feishu",
-        "accountId": "main"
-      }
-    },
-    {
-      "type": "acp",
-      "agentId": "codex",
-      "match": {
-        "channel": "feishu",
-        "accountId": "main",
-        "peer": {
-          "kind": "direct",
-          "id": "FEISHU_USER_ID_PLACEHOLDER"
-        }
-      },
-      "acp": {
-        "label": "codex-feishu-dm",
-        "cwd": "WORKSPACE_CODEX"
-      }
-    }
-  ],
-  "channels": {
-    "feishu": {
-      "enabled": true,
-      "appId": "FEISHU_APP_ID_PLACEHOLDER",
-      "appSecret": "FEISHU_APP_SECRET_PLACEHOLDER",
-      "connectionMode": "websocket",
-      "domain": "feishu",
-      "groupPolicy": "allowlist",
-      "groupAllowFrom": [
-        "oc_46753e08b6bf947e3aa7dd8a511d54e7"
-      ],
-      "webhookPath": "/feishu/events",
-      "dmPolicy": "pairing",
-      "reactionNotifications": "own",
-      "typingIndicator": true,
-      "resolveSenderNames": true
-    }
-  },
-  "gateway": {
-    "port": 18789,
-    "mode": "local",
-    "bind": "loopback",
-    "controlUi": {
-      "allowInsecureAuth": true
-    },
-    "auth": {
-      "mode": "token",
-      "token": "GATEWAY_TOKEN_PLACEHOLDER"
-    },
-    "tailscale": {
-      "mode": "off",
-      "resetOnExit": false
-    },
-    "nodes": {
-      "denyCommands": [
-        "camera.snap",
-        "camera.clip",
-        "screen.record",
-        "contacts.add",
-        "calendar.add",
-        "reminders.add",
-        "sms.send"
-      ]
-    }
-  },
-  "plugins": {
-    "entries": {
-      "feishu": {
-        "enabled": true,
-        "config": {}
-      },
-      "acpx": {
-        "enabled": true,
-        "config": {
-          "permissionMode": "approve-all",
-          "nonInteractivePermissions": "fail"
-        }
-      }
-    }
-  }
+]
+
+def deep_merge(dst, src):
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return deepcopy(src)
+    merged = deepcopy(dst)
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+by_id = {item.get("id"): idx for idx, item in enumerate(current) if isinstance(item, dict) and item.get("id")}
+for patch in patches:
+    item_id = patch["id"]
+    if item_id in by_id:
+        current[by_id[item_id]] = deep_merge(current[by_id[item_id]], patch)
+    else:
+        current.append(patch)
+
+for item in current:
+    if isinstance(item, dict) and item.get("id") == "main":
+        item["default"] = True
+
+with open(output_file, "w", encoding="utf-8") as fh:
+    json.dump(current, fh, ensure_ascii=False)
+PY
 }
-EOF
 
-# Replace placeholders
-sed -i "s|GITHUB_TOKEN_PLACEHOLDER|$GITHUB_TOKEN|g" "$CONFIG_FILE"
-sed -i "s|FEISHU_USER_ID_PLACEHOLDER|$FEISHU_USER_ID|g" "$CONFIG_FILE"
-sed -i "s|WORKSPACE_DEFAULT|$HOME/.openclaw/workspace|g" "$CONFIG_FILE"
-sed -i "s|WORKSPACE_CODEX|$WORKSPACES_DIR|g" "$CONFIG_FILE"
-sed -i "s|FEISHU_APP_ID_PLACEHOLDER|cli_a94041037678dcd2|g" "$CONFIG_FILE"
-sed -i "s|FEISHU_APP_SECRET_PLACEHOLDER|60iJBHmVfFtukhevoXhyNc5lBcbKXrYI|g" "$CONFIG_FILE"
-sed -i "s|GATEWAY_TOKEN_PLACEHOLDER|f66a5308d97c15147bd7b582c3dbbcd79a925887dec8d8ff|g" "$CONFIG_FILE"
+merge_bindings() {
+  local current_json="$1"
+  local account_id="$2"
+  local codex_workspace="$3"
+  local direct_open_id="${4:-}"
+  local output_file="$5"
 
-echo "  Config written to: $CONFIG_FILE"
+  CURRENT_JSON="$current_json" ACCOUNT_ID="$account_id" CODEX_WORKSPACE="$codex_workspace" DIRECT_OPEN_ID="$direct_open_id" OUTPUT_FILE="$output_file" python3 - <<'PY'
+import json
+import os
+from copy import deepcopy
 
-# ============================================================================
-# Step 8: Validate config
-# ============================================================================
-echo_step "Validating OpenClaw configuration..."
+current = json.loads(os.environ["CURRENT_JSON"] or "[]")
+account_id = os.environ["ACCOUNT_ID"]
+codex_workspace = os.environ["CODEX_WORKSPACE"]
+direct_open_id = os.environ["DIRECT_OPEN_ID"].strip()
+output_file = os.environ["OUTPUT_FILE"]
 
-if command -v openclaw &> /dev/null; then
-  VALIDATE_RESULT=$(openclaw config validate 2>&1)
-  if echo "$VALIDATE_RESULT" | grep -q "Config valid"; then
-    echo "  ✅ Config validation passed"
-  else
-    echo_error "Config validation failed:"
-    echo "$VALIDATE_RESULT"
+route_binding = {
+    "type": "route",
+    "agentId": "main",
+    "match": {"channel": "feishu", "accountId": account_id},
+}
+
+direct_binding = None
+if direct_open_id:
+    direct_binding = {
+        "type": "acp",
+        "agentId": "codex",
+        "match": {
+            "channel": "feishu",
+            "accountId": account_id,
+            "peer": {"kind": "direct", "id": direct_open_id},
+        },
+        "acp": {"label": "codex-feishu-dm", "cwd": codex_workspace},
+    }
+
+def binding_key(item):
+    if not isinstance(item, dict):
+        return None
+    match = item.get("match", {})
+    peer = match.get("peer") if isinstance(match, dict) else None
+    if item.get("type") == "route":
+        return ("route", match.get("channel"), match.get("accountId"))
+    if item.get("type") == "acp":
+        peer_kind = peer.get("kind") if isinstance(peer, dict) else None
+        peer_id = peer.get("id") if isinstance(peer, dict) else None
+        label = item.get("acp", {}).get("label") if isinstance(item.get("acp"), dict) else None
+        return ("acp", match.get("channel"), match.get("accountId"), peer_kind, peer_id, label)
+    return None
+
+def deep_merge(dst, src):
+    if not isinstance(dst, dict) or not isinstance(src, dict):
+        return deepcopy(src)
+    merged = deepcopy(dst)
+    for key, value in src.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+filtered = []
+for item in current:
+    key = binding_key(item)
+    if key and key[0] == "acp" and len(key) == 6 and key[5] == "codex-feishu-dm":
+        continue
+    filtered.append(item)
+
+patches = [route_binding]
+if direct_binding:
+    patches.append(direct_binding)
+
+index = {binding_key(item): idx for idx, item in enumerate(filtered) if binding_key(item) is not None}
+for patch in patches:
+    key = binding_key(patch)
+    if key in index:
+        filtered[index[key]] = deep_merge(filtered[index[key]], patch)
+    else:
+        filtered.append(patch)
+
+with open(output_file, "w", encoding="utf-8") as fh:
+    json.dump(filtered, fh, ensure_ascii=False)
+PY
+}
+
+check_codex_login() {
+  if ! codex login status >/dev/null 2>&1; then
+    log_error "Codex is not logged in."
+    echo "Run: codex login"
     exit 1
   fi
-else
-  echo_warn "openclaw command not found, skipping validation"
-fi
+}
 
-# ============================================================================
-# Step 9: Restart gateway
-# ============================================================================
-echo_step "Restarting OpenClaw Gateway..."
+maybe_install_bubblewrap() {
+  if command -v bwrap >/dev/null 2>&1; then
+    echo "  bubblewrap already installed"
+    return
+  fi
 
-if command -v openclaw &> /dev/null; then
-  openclaw gateway restart 2>&1 || true
-  sleep 2
-  echo "  Gateway restart initiated"
-else
-  echo_warn "openclaw command not found, please restart manually"
-fi
+  if [ "$(uname -s)" != "Linux" ]; then
+    log_warn "bubblewrap install skipped: non-Linux host."
+    return
+  fi
 
-# ============================================================================
-# Done
-# ============================================================================
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Setup Complete! 🎉${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
-echo "Next steps:"
-echo "  1. Test in Feishu: send '/acp spawn codex'"
-echo "  2. Then try a coding task like:"
-echo "     '创建 hello.py，输出 Hello World'"
-echo ""
-echo "For session management:"
-echo "  /acp status   - check session status"
-echo "  /acp close    - close current session"
-echo ""
+  if ! command -v apt-get >/dev/null 2>&1; then
+    log_warn "bubblewrap install skipped: apt-get not available."
+    return
+  fi
+
+  log_warn "bubblewrap not found. Attempting to install with apt-get."
+  if command -v sudo >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y bubblewrap
+  else
+    apt-get update
+    apt-get install -y bubblewrap
+  fi
+}
+
+configure_openclaw() {
+  local agents_json
+  local bindings_json
+  local agents_tmp
+  local bindings_tmp
+
+  log_step "Applying OpenClaw configuration"
+
+  openclaw config set session.dmScope per-channel-peer
+
+  openclaw config set models.mode merge
+  openclaw config set models.providers.minimax.baseUrl '${MINIMAX_BASE_URL}'
+  openclaw config set models.providers.minimax.api '${MINIMAX_API_MODE}'
+  openclaw config set models.providers.minimax.apiKey '${MINIMAX_API_KEY}'
+  openclaw config set models.providers.minimax.models '[{"id":"MiniMax-M2.7","name":"MiniMax M2.7","reasoning":true,"input":["text","image"],"contextWindow":204800,"maxTokens":131072}]' --strict-json
+
+  openclaw config set agents.defaults.workspace "$DEFAULT_WORKSPACE"
+  openclaw config set agents.defaults.model.primary minimax/MiniMax-M2.7
+
+  agents_json="$(json_get_or_default 'agents.list' '[]')"
+  agents_tmp="$(mktemp)"
+  merge_agents "$agents_json" "$DEFAULT_WORKSPACE" "$CODEX_WORKSPACE" "$agents_tmp"
+  openclaw config set agents.list "$(cat "$agents_tmp")" --strict-json
+  rm -f "$agents_tmp"
+
+  openclaw config set acp.enabled true --strict-json
+  openclaw config set acp.dispatch.enabled true --strict-json
+  openclaw config set acp.backend acpx
+  openclaw config set acp.defaultAgent codex
+  openclaw config set acp.allowedAgents '["codex"]' --strict-json
+
+  openclaw config set plugins.entries.acpx.enabled true --strict-json
+  openclaw config set plugins.entries.acpx.config.permissionMode approve-all
+  openclaw config set plugins.entries.acpx.config.nonInteractivePermissions fail
+
+  openclaw config set channels.feishu.enabled true --strict-json
+  openclaw config set channels.feishu.defaultAccount "$DEFAULT_FEISHU_ACCOUNT"
+  openclaw config set channels.feishu.domain '${FEISHU_DOMAIN}'
+  openclaw config set channels.feishu.connectionMode websocket
+  openclaw config set channels.feishu.dmPolicy pairing
+  openclaw config set channels.feishu.streaming true --strict-json
+  openclaw config set channels.feishu.blockStreaming true --strict-json
+  openclaw config set channels.feishu.accounts.main.appId '${FEISHU_APP_ID}'
+  openclaw config set channels.feishu.accounts.main.appSecret '${FEISHU_APP_SECRET}'
+  openclaw config set channels.feishu.accounts.main.name '${FEISHU_ACCOUNT_NAME}'
+
+  bindings_json="$(json_get_or_default 'bindings' '[]')"
+  bindings_tmp="$(mktemp)"
+  merge_bindings "$bindings_json" "$DEFAULT_FEISHU_ACCOUNT" "$CODEX_WORKSPACE" "${FEISHU_DM_OPEN_ID:-}" "$bindings_tmp"
+  openclaw config set bindings "$(cat "$bindings_tmp")" --strict-json
+  rm -f "$bindings_tmp"
+}
+
+validate_and_restart() {
+  log_step "Validating configuration"
+  openclaw config validate
+
+  log_step "Restarting gateway"
+  openclaw gateway restart
+}
+
+post_install_checks() {
+  log_step "Running post-install checks"
+  openclaw gateway status || log_warn "Gateway status check failed."
+
+  if openclaw secrets audit --check >/dev/null 2>&1; then
+    echo "  secret audit clean"
+  else
+    log_warn "Secret audit reported findings. Run: openclaw secrets audit"
+  fi
+}
+
+main() {
+  require_command openclaw
+  require_command codex
+  require_command python3
+
+  ensure_state_dir
+  load_env_file
+  CODEX_WORKSPACE="${REMOTE_CODING_WORKSPACE:-$CODEX_WORKSPACE_DEFAULT}"
+
+  log_step "Checking Codex login"
+  check_codex_login
+
+  log_step "Checking bubblewrap"
+  maybe_install_bubblewrap
+
+  prompt_var REMOTE_CODING_WORKSPACE "Codex workspace path" false true "$CODEX_WORKSPACE"
+  CODEX_WORKSPACE="$REMOTE_CODING_WORKSPACE"
+
+  mkdir -p "$DEFAULT_WORKSPACE" "$CODEX_WORKSPACE"
+
+  prompt_var MINIMAX_API_KEY "MiniMax API key" true true
+  prompt_var MINIMAX_BASE_URL "MiniMax base URL" false true "https://api.minimax.io/anthropic"
+  prompt_var MINIMAX_API_MODE "MiniMax API mode" false true "anthropic-messages"
+  prompt_var FEISHU_APP_ID "Feishu App ID" false true
+  prompt_var FEISHU_APP_SECRET "Feishu App Secret" true true
+  prompt_var FEISHU_DOMAIN "Feishu domain (feishu or lark)" false true "feishu"
+  prompt_var FEISHU_ACCOUNT_NAME "Feishu bot display name" false true "Remote Coding Bot"
+  prompt_var GITHUB_TOKEN "GitHub token for git push helpers (optional)" true false
+  prompt_var FEISHU_DM_OPEN_ID "Optional Feishu open_id for direct Codex DM binding" false false
+
+  log_step "Updating OpenClaw environment file"
+  upsert_env_var MINIMAX_API_KEY "$MINIMAX_API_KEY"
+  upsert_env_var MINIMAX_BASE_URL "$MINIMAX_BASE_URL"
+  upsert_env_var MINIMAX_API_MODE "$MINIMAX_API_MODE"
+  upsert_env_var FEISHU_APP_ID "$FEISHU_APP_ID"
+  upsert_env_var FEISHU_APP_SECRET "$FEISHU_APP_SECRET"
+  upsert_env_var FEISHU_DOMAIN "$FEISHU_DOMAIN"
+  upsert_env_var FEISHU_ACCOUNT_NAME "$FEISHU_ACCOUNT_NAME"
+  upsert_env_var REMOTE_CODING_WORKSPACE "$REMOTE_CODING_WORKSPACE"
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    upsert_env_var GITHUB_TOKEN "$GITHUB_TOKEN"
+  fi
+  if [ -n "${FEISHU_DM_OPEN_ID:-}" ]; then
+    upsert_env_var FEISHU_DM_OPEN_ID "$FEISHU_DM_OPEN_ID"
+  else
+    unset_env_var FEISHU_DM_OPEN_ID
+  fi
+
+  configure_openclaw
+  validate_and_restart
+  post_install_checks
+
+  echo ""
+  echo -e "${GREEN}Setup complete.${NC}"
+  echo ""
+  echo "Config file: $(openclaw config file)"
+  echo "Env file:    $ENV_FILE"
+  echo "Workspace:   $CODEX_WORKSPACE"
+  echo ""
+  echo "Default flow:"
+  echo "  1. Start with a normal Feishu DM to the main agent"
+  echo "  2. Run: /acp doctor"
+  echo "  3. Run: /acp spawn codex --thread here"
+  echo "  4. Send a coding request in that bound thread"
+  echo ""
+  if [ -n "${FEISHU_DM_OPEN_ID:-}" ]; then
+    echo "Direct DM binding was configured for: ${FEISHU_DM_OPEN_ID}"
+  else
+    echo "No direct DM-to-Codex binding was created."
+  fi
+  echo ""
+  log_warn "If Codex sandbox still fails in your host environment, handle that as a host-specific deployment issue."
+  log_warn "This installer does not force vendor-side sandbox bypass flags."
+}
+
+main "$@"
